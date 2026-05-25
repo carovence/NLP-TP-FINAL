@@ -11,3 +11,4 @@ __pycache__/
 # Datos pesados
 *.pt
 *.faiss
+.DS_Store
