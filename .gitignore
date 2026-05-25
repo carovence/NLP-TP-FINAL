@@ -1,0 +1,13 @@
+# Secrets - NUNCA subir
+.env
+*.key
+secrets.py
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Datos pesados
+*.pt
+*.faiss
