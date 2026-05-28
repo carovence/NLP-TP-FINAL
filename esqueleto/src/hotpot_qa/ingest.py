@@ -42,25 +42,25 @@ def main():
     )
     args = parser.parse_args()
 
-    # === 1. Cargar dataset ===
+    # dataset
     ds = load_dataset(args.dataset)
     ds = ds["validation"]
 
-    # === 2. Extraer y deduplicar pasajes ===
-    corpus = {}   # diccionario: titulo -> texto
+    # extraemos del dataset un diccionario con título -> texto concatenado de oraciones
+    corpus = {}   # diccionario (titulo -> texto)
     for respuesta in ds:
         titulo_rta = respuesta["context"]["title"]
         oraciones_rta = respuesta["context"]["sentences"]
         for titulo, parrafo in zip(titulo_rta, oraciones_rta):
-            if titulo in corpus:
+            if titulo in corpus: #si el titulo ya existe, no volvemos a agregar el texto al diccionario
                 continue
             texto_oraciones = " ".join(parrafo)
             corpus[titulo] = texto_oraciones
 
-    titulos = list(corpus.keys())
+    titulos = list(corpus.keys()) #vamos a dejar los titulos para metadata de la base
     textos = list(corpus.values())
 
-    # === 3. Cargar modelo BGE ===
+    # modelo de embeddings
     tokenizer = AutoTokenizer.from_pretrained(args.embedding_model)
     model = AutoModel.from_pretrained(args.embedding_model)
     model.eval()
@@ -73,11 +73,11 @@ def main():
         device = "cpu"
     model = model.to(device=device)
 
-    # === 4. Conectar a ChromaDB ===
+    # conexión a ChromaDB
     client = chromadb.PersistentClient(args.chroma_path)
     collection = client.get_or_create_collection(args.collection)
 
-    # === 5. Vectorizar en lotes y guardar ===
+    # vectorizamos e insertamos en ChromaDB por batch
     for i in tqdm(range(0, len(textos), args.batch_size)):
         batch_textos = textos[i : i + args.batch_size]
         batch_titulos = titulos[i : i + len(batch_textos)]
@@ -90,11 +90,16 @@ def main():
             max_length=args.model_max_length,
             return_tensors='pt',
         ).to(device)
+        #importante a tener en cuenta para las queries:
+        # for s2p(short query to long passage) retrieval task, add an instruction to query (not add instruction for passages)
+
 
         with torch.no_grad():
             model_output = model(**encoded_input)
-            sentence_embeddings = model_output[0][:, 0]   # CLS pooling
+            # Perform pooling. In this case, cls pooling.
+            sentence_embeddings = model_output[0][:, 0]  
 
+        # normalize embeddings
         sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
 
         collection.add(
@@ -104,7 +109,7 @@ def main():
             metadatas=[{"titulo": t} for t in batch_titulos],
         )
 
-    print(f"Listo. Total de documentos en ChromaDB: {collection.count()}")
+    print(f"Total de documentos en ChromaDB: {collection.count()}")
 
 if __name__ == "__main__":
     main()
