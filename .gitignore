@@ -3,6 +3,9 @@
 *.key
 secrets.py
 
+# Claude Code (sesión local, no se sube)
+.claude/
+
 # Python
 __pycache__/
 *.pyc
