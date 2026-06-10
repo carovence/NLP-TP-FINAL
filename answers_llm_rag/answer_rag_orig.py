@@ -1,11 +1,16 @@
-
 import argparse
+import string
+from collections import Counter
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import chromadb
 import torch
+from datasets import load_dataset
 from litellm import completion
 from tqdm.auto import tqdm
-from transformers import AutoModel
+from transformers import AutoTokenizer, AutoModel
 
 
 
@@ -24,8 +29,8 @@ def main():
     )
     parser.add_argument(
         "--embedding-model",
-        default="jinaai/jina-embeddings-v5-text-nano",
-        help="Modelo de embeddings (default: jinaai/jina-embeddings-v5-text-nano)",
+        default="BAAI/bge-small-en-v1.5",
+        help="Modelo de embeddings (default: BAAI/bge-small-en-v1.5)",
     )
     parser.add_argument(
         "--model",

@@ -1,0 +1,5 @@
+{
+    "python.REPL.enableREPLSmartSend": false,
+    "python.defaultInterpreterPath": "${workspaceFolder}/esqueleto/.venv/bin/python",
+    "python-envs.defaultEnvManager": "ms-python.python:venv"
+}
