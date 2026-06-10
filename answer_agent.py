@@ -62,8 +62,8 @@ def main():
     parser.add_argument(
         "--limit",
         type=int,
-        default=50,
-        help="Limitar la cantidad de preguntas a responder (default: 10 para prueba)",
+        default=None,
+        help="Limitar la cantidad de preguntas a responder (default: sin límite, procesa todo el split)",
     )
     parser.add_argument(
         "--output",
