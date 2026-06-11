@@ -87,7 +87,7 @@ def main():
 
     respuestas = []
 
-    for ejemplo in ds:
+    for i, ejemplo in enumerate(ds):
         pregunta = ejemplo["question"]
 
         # recuperar pasajes de Wikipedia: top-k titulos + resumen de cada pagina.
@@ -113,6 +113,8 @@ def main():
             temperature=0,
         )
         respuesta_pred = response.choices[0].message.content
+
+        print(f"[{i+1}/{len(ds)}]")
 
         respuestas.append({
             "id": ejemplo["id"],
