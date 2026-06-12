@@ -1,8 +1,9 @@
-import argparse
-import json
-import os
-import re
-from datetime import datetime
+import argparse                 # parsea los argumentos de linea de comandos (--limit, --model, etc.)
+import json                     # serializa cada respuesta a JSON para el .jsonl
+import os                       # manejo de rutas (anclar el output a la carpeta del script)
+import re                       # expresiones regulares para parsear la salida del LLM
+import time                     # sleep() para los reintentos con backoff y el rate limiting
+from datetime import datetime   # timestamp en el nombre del archivo de salida
 
 from datasets import load_dataset
 from dotenv import load_dotenv
@@ -13,24 +14,41 @@ import wikipedia
 load_dotenv()
 
 # idioma inglés y user-agent requerido por la API de Wikipedia
-wikipedia.set_lang("en")
-wikipedia.set_user_agent("User-Agent: InfinitumBotty/0.1 (https://github.com/ctx77/InfinitumBotty) python-via-wikipedia-module/1.4.0")
+wikipedia.set_lang("en")  # todas las consultas se hacen contra en.wikipedia.org
+wikipedia.set_user_agent("User-Agent: InfinitumBotty/0.1 (https://github.com/ctx77/InfinitumBotty) python-via-wikipedia-module/1.4.0")  # la API rechaza el UA por defecto y devuelve no-JSON
+wikipedia.set_rate_limiting(True)  # FIX #4: espacia las requests para evitar que la API corte la conexion (RemoteDisconnected)
 
 
 # ── Tool 1: busca títulos de páginas en Wikipedia ─────────────────────────────
-def wikipedia_search(query):
-    resultados = wikipedia.search(query, results=5)   # devuelve lista de títulos
-    return "Titles: " + ", ".join(resultados)
+def wikipedia_search(query, retries=3):
+    for intento in range(retries):                          # FIX #1: hasta 3 intentos ante cortes de red
+        try:
+            resultados = wikipedia.search(query, results=5)  # devuelve una lista de titulos
+            return "Titles: " + ", ".join(resultados)        # los unimos en un string para el LLM
+        except Exception as e:                               # captura RemoteDisconnected, ConnectionError, etc.
+            if intento < retries - 1:                        # si quedan intentos, esperamos y reintentamos
+                time.sleep(2 * (intento + 1))                # backoff incremental: 2s, 4s
+                continue                                     # vuelve al for para reintentar
+            return f"Error searching: {e}"                   # agotados los intentos: devolvemos el error como Observation (NO rompe el loop)
 
 
 # ── Tool 2: devuelve el resumen de una página dado su título ──────────────────
-def wikipedia_summary(title):
-    try:
-        return wikipedia.summary(title, sentences=3)  # primeras 3 oraciones
-    except wikipedia.exceptions.DisambiguationError as e:
-        return wikipedia.summary(e.options[0], sentences=3)  # si es ambiguo, toma la primera opción
-    except Exception as e:
-        return f"Error: {e}"
+def wikipedia_summary(title, retries=3):
+    for intento in range(retries):                                          # FIX #1: mismos reintentos que la otra tool
+        try:
+            return wikipedia.summary(title, sentences=3, auto_suggest=False)  # resumen de 3 oraciones del titulo exacto
+        except wikipedia.exceptions.DisambiguationError as e:               # el titulo es ambiguo (varias paginas posibles)
+            try:
+                return wikipedia.summary(e.options[0], sentences=3, auto_suggest=False)  # probamos la primera opcion sugerida
+            except Exception:
+                return f"Disambiguation: could not resolve '{title}'"       # ni asi: devolvemos aviso (no rompe)
+        except wikipedia.exceptions.PageError as e:                         # el titulo no existe: no tiene sentido reintentar
+            return f"Error: {e}"                                            # devolvemos el error directo
+        except Exception as e:                                              # error de red u otro transitorio
+            if intento < retries - 1:                                       # si quedan intentos, backoff y reintento
+                time.sleep(2 * (intento + 1))                               # 2s, 4s
+                continue
+            return f"Error: {e}"                                            # agotados los intentos: error como Observation
 
 
 # ── Diccionario de tools disponibles para el agente ──────────────────────────
@@ -97,13 +115,23 @@ def react_loop(pregunta, model, max_steps=4):
             return match_final.group(1).strip()
 
         # si no terminó, parseamos qué tool quiere usar y con qué input
-        match_action = re.search(r"Action:\s*(\w+)", text)
-        match_input  = re.search(r"Action Input:\s*(.+?)(?:\n|$)", text)
+        match_action = re.search(r"Action:\s*(\w+)", text)            # capturamos el nombre de la tool
+        match_input  = re.search(r"Action Input:\s*(.+?)(?:\n|$)", text)  # capturamos el input de la tool
 
-        # ejecutamos la tool y guardamos el resultado como Observation
-        tool_name   = match_action.group(1).strip()
-        tool_input  = match_input.group(1).strip()
-        observation = TOOLS[tool_name](tool_input)
+        # FIX #2: si el LLM no respetó el formato, match_* es None y .group(1) rompería con AttributeError
+        if not match_action or not match_input:                       # falta Action o Action Input
+            messages.append({"role": "user", "content":              # le pedimos que reintente con el formato correcto
+                "Formato inválido. Usá 'Action:' + 'Action Input:' o 'Final Answer:'."})
+            continue                                                  # saltamos al proximo paso del loop sin ejecutar tool
+
+        tool_name  = match_action.group(1).strip()                    # nombre de la tool (ya sabemos que existe el match)
+        tool_input = match_input.group(1).strip()                     # input de la tool
+
+        # FIX #2: si el LLM inventa un nombre de tool, TOOLS[tool_name] tiraría KeyError
+        if tool_name not in TOOLS:                                    # tool inexistente
+            observation = f"Error: tool '{tool_name}' no existe. Usá: {', '.join(TOOLS)}"  # avisamos las validas
+        else:
+            observation = TOOLS[tool_name](tool_input)                # ejecutamos la tool elegida
 
         # agregamos la Observation al historial para que el LLM la vea en el próximo paso
         messages.append({"role": "user", "content": f"Observation: {observation}"})
@@ -128,50 +156,56 @@ def main():
     parser.add_argument("--dataset",   default="nlp-udesa/hotpot_qa_3k")
     parser.add_argument("--model",     default="gpt-4o-mini")
     parser.add_argument("--max-steps", type=int, default=4)  # 4 pasos max para no explotar el contexto (límite fijo del servidor de OpenAI, no configurable)
-    parser.add_argument("--limit",     type=int, default=None)
+    parser.add_argument("--start",     type=int, default=0)   # indice (0-based) desde donde arrancar: para RETOMAR una corrida cortada
+    parser.add_argument("--limit",     type=int, default=None) # indice EXCLUSIVO donde terminar (None = hasta el final del split)
     parser.add_argument("--output",    default="answers_agente/respuestas_agente.jsonl")
     args = parser.parse_args()
 
     ### BEGIN SOLUTION
 
     # cargamos el split de validación del dataset
-    ds = load_dataset(args.dataset)["validation"]
-    if args.limit is not None:
-        ds = ds.select(range(args.limit))  # tomamos solo las primeras N preguntas
+    ds = load_dataset(args.dataset)["validation"]   # HotpotQA 3k, split de validacion
 
-    respuestas = []
+    # recortamos el rango [start, fin): start permite RETOMAR desde donde se cortó la corrida
+    fin = args.limit if args.limit is not None else len(ds)  # fin exclusivo (default = todo el split)
+    ds = ds.select(range(args.start, fin))          # ej: --start 528 arranca en la pregunta 528 (0-based)
 
-    for i, ejemplo in enumerate(ds):
-        pregunta = ejemplo["question"]
-        print(f"[{i+1}/{len(ds)}] {pregunta}")
+    # FIX #3: construimos la ruta de salida ANTES del loop para poder ir escribiendo a medida que avanzamos
+    output = args.output                            # ruta pedida por el usuario (relativa o absoluta)
+    if not os.path.isabs(output):                   # si es relativa...
+        output = os.path.join(os.path.dirname(os.path.abspath(__file__)), output)  # ...la anclamos a la carpeta del script
 
-        # corremos el loop ReACT para esta pregunta
-        respuesta_pred = react_loop(pregunta, model=args.model, max_steps=args.max_steps)
-        print(f"  → pred: {respuesta_pred} | true: {ejemplo['answer']}\n")
+    base, ext = os.path.splitext(output)            # separamos nombre y extension
+    output = f"{base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"  # timestamp para no pisar corridas previas
+    os.makedirs(os.path.dirname(output), exist_ok=True)  # FIX #3: aseguramos que la carpeta de salida exista
 
-        # guardamos el resultado con el formato que consume evaluar.py
-        respuestas.append({
-            "id":          ejemplo["id"],
-            "question":    pregunta,
-            "answer_pred": respuesta_pred,
-            "answer_true": ejemplo["answer"],
-        })
+    total = 0                                       # contador de respuestas escritas
 
-    # construimos la ruta de salida relativa a la ubicación del script
-    output = args.output
-    if not os.path.isabs(output):
-        output = os.path.join(os.path.dirname(os.path.abspath(__file__)), output)
+    # FIX #3: abrimos el archivo UNA vez y escribimos cada respuesta apenas la tenemos.
+    # Asi, si la corrida se corta (red, etc.), conservamos todo el progreso hasta ese punto.
+    with open(output, "w") as f:                    # modo escritura; el flush por linea preserva el progreso
+        for i, ejemplo in enumerate(ds):
+            pregunta = ejemplo["question"]
+            print(f"[{args.start + i + 1}/{fin}] {pregunta}")  # numeracion absoluta del split (no relativa al recorte)
 
-    # agregamos timestamp para no pisar corridas anteriores
-    base, ext = os.path.splitext(output)
-    output = f"{base}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}"
+            # corremos el loop ReACT para esta pregunta
+            respuesta_pred = react_loop(pregunta, model=args.model, max_steps=args.max_steps)
+            print(f"  → pred: {respuesta_pred} | true: {ejemplo['answer']}\n")
 
-    # escribimos el JSONL
-    with open(output, "w") as f:
-        for r in respuestas:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            # armamos el registro con el formato exacto que consume evaluar.py
+            registro = {
+                "id":          ejemplo["id"],
+                "question":    pregunta,
+                "answer_pred": respuesta_pred,
+                "answer_true": ejemplo["answer"],
+            }
+            f.write(json.dumps(registro, ensure_ascii=False) + "\n")  # escribimos la linea JSON
+            f.flush()                               # FIX #3: forzamos el volcado a disco en cada paso
+            total += 1                              # sumamos al contador
 
-    print(f"Listo. {len(respuestas)} respuestas guardadas en {output}")
+            time.sleep(0.5)                         # FIX #4: pausa entre preguntas para no saturar la API de Wikipedia
+
+    print(f"Listo. {total} respuestas guardadas en {output}")
 
     ### END SOLUTION
 
